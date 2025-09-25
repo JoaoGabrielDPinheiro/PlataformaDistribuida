@@ -1,3 +1,9 @@
+# src/backup.py
+import os, sys
+ROOT = os.path.dirname(os.path.abspath(__file__))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
 import threading
 import json
 import time
@@ -16,6 +22,7 @@ class BackupOrchestrator:
         self.running = True
         self.last_state_time = time.time()
         self.is_primary = False
+        self.assumed_orchestrator = None
 
     def start(self):
         t = threading.Thread(target=self._listen_loop, daemon=True)
@@ -37,24 +44,29 @@ class BackupOrchestrator:
                     # guardar checkpoint local
                     self._checkpoint()
             except Exception:
-                logger.exception("Erro ao receber multicast")
-            time.sleep(0.001)
+                # É normal gerar exceções ao encerrar
+                logger.debug("Erro/timeout recebendo multicast (ou socket fechado).")
+            time.sleep(0.01)
 
     def _failover_detector_loop(self):
         while self.running:
-            # se há mais de 5*interval sem mensagem => assumir primário
-            if time.time() - self.last_state_time > 5.0:
-                if not self.is_primary:
-                    logger.warning("Perda de contato com orquestrador principal. Assumindo papel de orquestrador principal (failover).")
-                    self.is_primary = True
-                    # aqui, idealmente, ativar serviços TCP para clientes/workers (simulado)
-                    # para a entrega acadêmica, podemos escrever state em arquivo e abrir porta para novos clients.
-                # se já é primário, poderia tentar operar; por simplicidade, apenas mantém estado e log
+            # se há mais de 5s sem mensagem => assumir primário
+            if time.time() - self.last_state_time > 5.0 and not self.is_primary:
+                logger.warning("Perda de contato com orquestrador principal. Tentando assumir (failover).")
+                self.is_primary = True
+                # iniciar um orquestrador local com o estado que temos
+                try:
+                    from orchestrator import Orchestrator
+                    # iniciar em uma thread separado para não bloquear o backup
+                    self.assumed_orchestrator = Orchestrator(initial_state=self.state)
+                    threading.Thread(target=self.assumed_orchestrator.start, daemon=True).start()
+                    logger.info("Orquestrador local iniciado pelo backup.")
+                except Exception:
+                    logger.exception("Erro ao iniciar orquestrador local a partir do backup")
             time.sleep(1.0)
 
     def _checkpoint(self):
         try:
-            import json
             with open(settings.STATE_CHECKPOINT_FILE + ".backup", "w", encoding="utf-8") as f:
                 json.dump(self.state, f, indent=2, default=str)
         except Exception:
@@ -65,6 +77,6 @@ if __name__ == "__main__":
     b.start()
     try:
         while True:
-            time.sleep(1.0)
+            time.sleep(1)
     except KeyboardInterrupt:
         logger.info("Backup encerrando...")

@@ -1,3 +1,10 @@
+# src/common.py
+import os, sys
+# Garantir que a pasta src esteja no sys.path quando executarmos scripts diretamente
+ROOT = os.path.dirname(os.path.abspath(__file__))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
 import socket
 import json
 import struct
