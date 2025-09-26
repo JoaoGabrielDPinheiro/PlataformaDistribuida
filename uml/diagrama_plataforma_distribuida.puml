@@ -1,0 +1,29 @@
+@startuml
+left to right direction
+actor Cliente
+actor Worker
+actor Backup as "Orquestrador Backup"
+
+rectangle "Plataforma Distribuída" {
+  usecase "Autenticar-se" as UC1
+  usecase "Submeter Tarefa" as UC2
+  usecase "Consultar Status" as UC3
+  usecase "Distribuir Tarefas" as UC4
+  usecase "Executar Tarefas" as UC5
+  usecase "Enviar Heartbeat" as UC6
+  usecase "Detectar Falha e Redistribuir" as UC7
+  usecase "Replicar Estado" as UC8
+  usecase "Assumir Controle em Falha" as UC9
+}
+
+Cliente --> UC1
+Cliente --> UC2
+Cliente --> UC3
+Worker --> UC5
+Worker --> UC6
+UC2 --> UC4
+UC4 --> UC5
+UC6 --> UC7
+Backup --> UC8
+UC8 --> UC9
+@enduml

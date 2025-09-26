@@ -1,0 +1,26 @@
+@startuml
+actor Cliente
+participant Orquestrador
+participant Worker1
+participant Worker2
+participant Backup
+
+Cliente -> Orquestrador : Autenticação
+Cliente -> Orquestrador : Submete Tarefa
+Orquestrador -> Worker1 : Enviar Tarefa
+Worker1 -> Orquestrador : Confirmação Recebida
+Worker1 -> Orquestrador : Heartbeat (status OK)
+
+... falha simulada ...
+Worker1 -> Orquestrador : (heartbeat ausente)
+Orquestrador -> Orquestrador : Detecta falha de Worker1
+Orquestrador -> Worker2 : Redistribui Tarefa
+Worker2 -> Orquestrador : Resultado da Tarefa
+Orquestrador -> Cliente : Status "done"
+
+== Failover ==
+Orquestrador -> Backup : Replicação de Estado
+Orquestrador X Backup : Orquestrador cai
+Backup -> Cliente : Assume como Orquestrador
+Cliente -> Backup : Submete nova tarefa
+@enduml

@@ -1,0 +1,20 @@
+@startuml
+package "Plataforma Distribuída" {
+
+  [Orquestrador Principal] --> [Workers]
+  [Orquestrador Principal] --> [Clientes]
+  [Orquestrador Principal] --> [Orquestrador Backup]
+
+  [Orquestrador Backup] -[#blue]> [Checkpoint]
+  [Orquestrador Principal] -[#blue]> [Checkpoint]
+
+  [Orquestrador Principal] -[#green]> [Logs]
+  [Orquestrador Backup] -[#green]> [Logs]
+
+}
+
+[Clientes] -[#red]> [Orquestrador Principal] : TCP
+[Workers] -[#red]> [Orquestrador Principal] : TCP
+[Orquestrador Principal] -[#red]> [Orquestrador Backup] : UDP Multicast
+
+@enduml
