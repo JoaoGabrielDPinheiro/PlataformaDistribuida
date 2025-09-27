@@ -1,78 +1,76 @@
 # src/worker.py
-import os, sys
-ROOT = os.path.dirname(os.path.abspath(__file__))
-if ROOT not in sys.path:
-    sys.path.insert(0, ROOT)
-
-import socket
 import threading
-import json
+import socket
 import time
-import uuid
+import json
 import struct
-from config import settings
-from lamport import LamportClock
-from logger_setup import get_logger
-from common import recvall
+import argparse
+import uuid
+import traceback
 
-logger = get_logger("worker")
+import config.settings as settings
+from src.common import send_json_tcp, recv_json_tcp
+from src.logger_setup import get_logger
+
+logger = get_logger("Worker")
 
 class Worker:
-    def __init__(self, host="127.0.0.1", port=0):
-        self.id = str(uuid.uuid4())[:8]
+    def __init__(self, host="127.0.0.1", port=0, worker_id=None):
         self.host = host
-        self.port = port  # 0 -> OS escolhe
-        self.server = None
-        self.lamport = LamportClock()
+        self.port = port  # 0 = escolher porta
+        self.id = worker_id or str(uuid.uuid4())[:8]
+        self.lamport = 0
         self.load = 0
         self.running = True
-        self.orch_host = settings.ORCHESTRATOR_HOST
-        self.orch_port = settings.ORCHESTRATOR_PORT
+        self.server = None
         self.fail_simulate = False
 
     def start(self):
-        # iniciar o servidor em thread
-        t = threading.Thread(target=self._tcp_server, daemon=True)
+        # iniciar servidor em thread
+        t = threading.Thread(target=self._server_loop, daemon=True)
         t.start()
-        # aguardar até que a porta real tenha sido atribuída (evita race)
+        # aguardar porta definida
         timeout = time.time() + 3.0
-        while getattr(self, "port", 0) == 0 and time.time() < timeout:
+        while (self.port == 0 or self.server is None) and time.time() < timeout:
             time.sleep(0.05)
-        # tentar registrar (agora com porta correta)
+        # registrar
         self._register()
-        t2 = threading.Thread(target=self._heartbeat_loop, daemon=True)
-        t2.start()
-        logger.info(f"Worker {self.id} iniciado (porta {self.port})")
+        # iniciar heartbeat
+        threading.Thread(target=self._heartbeat_loop, daemon=True).start()
+        logger.info(f"Worker {self.id} iniciado e registrado (porta {self.port})")
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            logger.info("Worker encerrando...")
 
-    def _tcp_server(self):
+    def _server_loop(self):
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind((self.host, self.port))
-        s.listen(5)
+        s.listen(10)
         self.server = s
         self.port = s.getsockname()[1]
-        while self.running:
+        while True:
             try:
                 conn, addr = s.accept()
                 threading.Thread(target=self._handle_conn, args=(conn, addr), daemon=True).start()
             except Exception:
                 logger.exception("Erro accept worker")
 
-    def _handle_conn(self, conn, addr):
+    def _handle_conn(self, conn: socket.socket, addr):
         try:
-            raw_len = recvall(conn, 4)
-            if not raw_len:
+            msg = recv_json_tcp(conn)
+            if not msg:
                 conn.close()
                 return
-            length = int.from_bytes(raw_len, "big")
-            raw = recvall(conn, length)
-            msg = json.loads(raw.decode("utf-8"))
             typ = msg.get("type")
             if typ == "execute_task":
                 resp = self._execute_task(msg)
-                self._send_response(conn, resp)
+                # enviar resposta no mesmo socket (sincrono)
+                send_json_tcp(conn, resp)
             else:
-                self._send_response(conn, {"ok": False, "error": "unknown"})
+                send_json_tcp(conn, {"ok": False, "error": "unknown_type"})
         except Exception:
             logger.exception("Erro handle_conn worker")
         finally:
@@ -81,89 +79,70 @@ class Worker:
             except:
                 pass
 
-    def _send_response(self, conn, obj):
-        try:
-            data = json.dumps(obj).encode("utf-8")
-            conn.sendall(len(data).to_bytes(4, "big"))
-            conn.sendall(data)
-        except Exception:
-            logger.exception("Erro enviando resposta no worker")
-
     def _register(self):
         try:
-            payload = {"type":"register_worker","worker_id":self.id,"host":self.host,"port":self.port, "load": self.load}
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(3.0)
-            s.connect((self.orch_host, self.orch_port))
-            data = json.dumps(payload).encode("utf-8")
-            s.sendall(struct.pack("!I", len(data)))
-            s.sendall(data)
-            raw_len = recvall(s, 4)
-            if raw_len:
-                l = int.from_bytes(raw_len, "big")
-                raw = recvall(s, l)
-                resp = json.loads(raw.decode("utf-8"))
-                logger.info(f"Registro respondido: {resp}")
+            s.connect((settings.ORCHESTRATOR_HOST, settings.ORCHESTRATOR_PORT))
+            payload = {"type": "register_worker", "worker_id": self.id, "host": self.host, "port": self.port}
+            send_json_tcp(s, payload)
+            resp = recv_json_tcp(s)
             s.close()
+            logger.info(f"Registro resposta: {resp}")
         except Exception:
             logger.exception("Falha ao registrar worker")
 
     def _heartbeat_loop(self):
-        while self.running:
+        while True:
             try:
                 if self.fail_simulate:
                     # simular falha: não envia heartbeat
                     time.sleep(settings.HEARTBEAT_INTERVAL)
                     continue
-                payload = {"type":"heartbeat","worker_id":self.id,"load":self.load,"host":self.host,"port":self.port,"lamport": self.lamport.tick()}
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(2.0)
-                s.connect((self.orch_host, self.orch_port))
-                data = json.dumps(payload).encode("utf-8")
-                s.sendall(struct.pack("!I", len(data)))
-                s.sendall(data)
-                raw_len = recvall(s, 4)
-                if raw_len:
-                    l = int.from_bytes(raw_len, "big")
-                    raw = recvall(s, l)
-                    resp = json.loads(raw.decode("utf-8"))
-                    if resp.get("ok"):
-                        self.lamport.update(resp.get("lamport", 0))
+                s.settimeout(3.0)
+                s.connect((settings.ORCHESTRATOR_HOST, settings.ORCHESTRATOR_PORT))
+                payload = {"type": "heartbeat", "worker_id": self.id, "load": self.load, "lamport": self.lamport}
+                send_json_tcp(s, payload)
+                resp = recv_json_tcp(s)
+                if resp and resp.get("lamport") is not None:
+                    # não usamos Lamport completo aqui, só guardamos se quiser
+                    self.lamport = max(self.lamport, int(resp.get("lamport", 0)))
                 s.close()
             except Exception:
-                logger.debug("Heartbeat falhou (orquestrador pode estar offline).")
+                # falha em conectar heartbeat é aceitável se orchestrator estiver offline
+                pass
             time.sleep(settings.HEARTBEAT_INTERVAL)
 
-    def _execute_task(self, msg):
-        task_id = msg.get("task_id")
+    def _execute_task(self, msg: dict):
+        tid = msg.get("task_id")
         payload = msg.get("payload") or {}
-        lam = msg.get("lamport", 0)
-        self.lamport.update(lam)
-        # aumentar load localmente para refletir execução
         self.load += 1
-        logger.info(f"Executando tarefa {task_id} payload={payload}")
+        logger.info(f"Worker {self.id} executando tarefa {tid} payload={payload}")
         try:
-            work_time = float(payload.get("duration", 2))
+            # simular crash se solicitado
             if payload.get("crash"):
-                # simular falha: parar heartbeats e lançar erro
-                logger.warning("Simulando falha no worker (crash).")
+                logger.warning("Worker simulando crash (parando heartbeats).")
                 self.fail_simulate = True
                 raise RuntimeError("Simulated crash")
-            time.sleep(work_time)
-            result = {"ok": True, "task_id": task_id, "result": f"Processed by {self.id}"}
-            logger.info(f"Tarefa {task_id} concluída localmente.")
+            duration = float(payload.get("duration", 1))
+            time.sleep(duration)
+            result = {"ok": True, "task_id": tid, "worker_id": self.id, "result": f"Processed by {self.id}"}
+            logger.info(f"Worker {self.id} completou tarefa {tid}")
+            return result
         except Exception as e:
             logger.exception("Erro executando tarefa")
-            result = {"ok": False, "task_id": task_id, "error": str(e)}
+            return {"ok": False, "task_id": tid, "worker_id": self.id, "error": str(e)}
         finally:
-            self.load = max(0, self.load - 1)
-        return result
+            # apenas ajustar load se não simulou crash permanente
+            if not self.fail_simulate:
+                self.load = max(0, self.load - 1)
 
 if __name__ == "__main__":
-    w = Worker()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=0)
+    parser.add_argument("--id", default=None)
+    args = parser.parse_args()
+    w = Worker(host=args.host, port=args.port, worker_id=args.id)
     w.start()
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        logger.info("Worker encerrando...")

@@ -1,372 +1,269 @@
 # src/orchestrator.py
-import os, sys
-ROOT = os.path.dirname(os.path.abspath(__file__))
-if ROOT not in sys.path:
-    sys.path.insert(0, ROOT)
-
 import socket
 import threading
 import json
 import time
 import uuid
 import struct
-from config import settings
-from lamport import LamportClock
-from auth import SimpleAuth
-from logger_setup import get_logger
-from common import recvall, start_multicast_sender
+import os
 
-logger = get_logger("orchestrator")
+import config.settings as settings
+from src.common import recvall, send_json_tcp, recv_json_tcp, send_json_udp, create_multicast_sender
+from src.lamport import LamportClock
+from src.auth import SimpleAuth
+from src.logger_setup import get_logger
+
+logger = get_logger("Orchestrator")
 
 class Orchestrator:
-    def __init__(self, host=settings.ORCHESTRATOR_HOST, port=settings.ORCHESTRATOR_PORT, initial_state=None):
-        self.host = host
-        self.port = port
-        self.server = None
-        self.lock = threading.Lock()
+    def __init__(self, host=None, port=None, initial_state=None):
+        self.host = host or settings.ORCHESTRATOR_HOST
+        self.port = port or settings.ORCHESTRATOR_PORT
         self.lamport = LamportClock()
         self.auth = SimpleAuth()
-        self.workers = {}
-        self.tasks = {}
-        self.multicast_sock = start_multicast_sender(settings.BACKUP_MULTICAST_GROUP, settings.BACKUP_MULTICAST_PORT)
+        self.workers = {}  # worker_id -> {host, port, last_hb, load, status}
+        self.tasks = {}    # task_id -> {client, payload, status, assigned_worker, result, timestamps}
+        self.lock = threading.Lock()
         self.running = True
-        self.balance_policy = "least_load"
 
-        # restaurar estado passado (ex: backup ao assumir)
+        # restore if provided (from backup)
         if initial_state:
             try:
-                self.workers = initial_state.get("workers", {}) or {}
-                self.tasks = initial_state.get("tasks", {}) or {}
-                lam = initial_state.get("lamport", 0)
-                # ajustar relógio lamport
-                self.lamport.time = lam
-                logger.info("Estado inicial carregado no orquestrador (from backup).")
+                with self.lock:
+                    self.workers = initial_state.get("workers", {}) or {}
+                    self.tasks = initial_state.get("tasks", {}) or {}
+                    self.lamport.update(initial_state.get("lamport", 0) or 0)
+                logger.info("Orchestrator: estado inicial carregado (do backup).")
             except Exception:
-                logger.exception("Falha ao carregar estado inicial")
+                logger.exception("Erro ao carregar estado inicial")
 
-        # tentar carregar checkpoint local se existir
+        # tenta carregar checkpoint do disco
         self._load_checkpoint_on_startup()
 
     def _load_checkpoint_on_startup(self):
-        try:
-            if os.path.exists(settings.STATE_CHECKPOINT_FILE):
+        if os.path.exists(settings.STATE_CHECKPOINT_FILE):
+            try:
                 with open(settings.STATE_CHECKPOINT_FILE, "r", encoding="utf-8") as f:
                     st = json.load(f)
-                    with self.lock:
-                        self.workers = st.get("workers", {}) or {}
-                        self.tasks = st.get("tasks", {}) or {}
-                        lam = st.get("lamport", 0)
-                        self.lamport.time = lam
-                    logger.info("Checkpoint carregado do disco.")
-        except Exception:
-            logger.exception("Erro ao carregar checkpoint na inicialização")
+                with self.lock:
+                    self.workers = st.get("workers", {}) or {}
+                    self.tasks = st.get("tasks", {}) or {}
+                    self.lamport.update(st.get("lamport", 0) or 0)
+                logger.info("Orchestrator: checkpoint carregado do disco.")
+            except Exception:
+                logger.exception("Erro ao carregar checkpoint")
 
     def start(self):
-        t = threading.Thread(target=self._tcp_server_loop, daemon=True)
-        t.start()
-        t2 = threading.Thread(target=self._heartbeat_checker_loop, daemon=True)
-        t2.start()
-        t3 = threading.Thread(target=self._state_multicast_loop, daemon=True)
-        t3.start()
-        logger.info(f"Orquestrador iniciado em {self.host}:{self.port}")
+        # threads auxiliares
+        threading.Thread(target=self._heartbeat_checker_loop, daemon=True).start()
+        threading.Thread(target=self._state_multicast_loop, daemon=True).start()
 
-    def _tcp_server_loop(self):
-        self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.server.bind((self.host, self.port))
-        self.server.listen(10)
-        while self.running:
-            try:
-                conn, addr = self.server.accept()
+        # servidor TCP principal
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind((self.host, self.port))
+        server.listen(50)
+        logger.info(f"Orchestrator iniciado em {self.host}:{self.port}")
+
+        try:
+            while self.running:
+                conn, addr = server.accept()
                 threading.Thread(target=self._handle_conn, args=(conn, addr), daemon=True).start()
-            except Exception:
-                logger.exception("Erro accept no servidor TCP do orquestrador")
+        except KeyboardInterrupt:
+            logger.info("Orchestrator encerrando (KeyboardInterrupt).")
+        except Exception:
+            logger.exception("Erro no servidor principal")
+        finally:
+            server.close()
 
     def _handle_conn(self, conn: socket.socket, addr):
         try:
-            raw_len = recvall(conn, 4)
-            if not raw_len:
-                conn.close()
+            msg = recv_json_tcp(conn)
+            if not msg:
                 return
-            length = int.from_bytes(raw_len, "big")
-            raw = recvall(conn, length)
-            msg = json.loads(raw.decode("utf-8"))
             typ = msg.get("type")
-            if typ == "register_worker":
-                resp = self._register_worker(msg, addr)
-                self._send_response(conn, resp)
-            elif typ == "heartbeat":
-                resp = self._handle_heartbeat(msg)
-                self._send_response(conn, resp)
-            elif typ == "submit_task":
-                resp = self._handle_submit_task(msg)
-                self._send_response(conn, resp)
-            elif typ == "query_status":
-                resp = self._handle_query(msg)
-                self._send_response(conn, resp)
-            elif typ == "auth":
+            # aceitar login/auth tanto 'auth' quanto 'login'
+            if typ in ("auth", "login"):
                 token = self.auth.login(msg.get("username"), msg.get("password"))
-                self._send_response(conn, {"ok": bool(token), "token": token})
+                send_json_tcp(conn, {"ok": bool(token), "token": token})
+            elif typ == "register_worker":
+                wid = msg.get("worker_id") or msg.get("id") or str(uuid.uuid4())
+                host = msg.get("host") or addr[0]
+                port = int(msg.get("port"))
+                with self.lock:
+                    self.workers[wid] = {"host": host, "port": port, "last_hb": time.time(), "load": 0, "status": "active"}
+                    self.lamport.tick()
+                logger.info(f"Worker registrado: {wid} @ {host}:{port}")
+                self._checkpoint_state()
+                send_json_tcp(conn, {"ok": True, "worker_id": wid})
+            elif typ == "heartbeat":
+                wid = msg.get("worker_id") or msg.get("id")
+                with self.lock:
+                    if wid in self.workers:
+                        self.workers[wid]["last_hb"] = time.time()
+                        self.workers[wid]["load"] = int(msg.get("load", self.workers[wid].get("load", 0)))
+                        self.lamport.update(msg.get("lamport", 0) or 0)
+                send_json_tcp(conn, {"ok": True, "lamport": self.lamport.read()})
+            elif typ == "submit_task":
+                token = msg.get("token")
+                if not self.auth.validate(token):
+                    send_json_tcp(conn, {"ok": False, "error": "unauthenticated"})
+                    return
+                payload = msg.get("payload", {})
+                task_id = str(uuid.uuid4())
+                with self.lock:
+                    self.tasks[task_id] = {
+                        "client": self.auth.user_of(token),
+                        "payload": payload,
+                        "status": "pending",
+                        "assigned_worker": None,
+                        "result": None,
+                        "created_at": time.time()
+                    }
+                    self.lamport.tick()
+                # tentar atribuir imediatamente
+                assigned = self._assign_task(task_id)
+                self._checkpoint_state()
+                send_json_tcp(conn, {"ok": True, "task_id": task_id, "assigned": bool(assigned)})
+            elif typ in ("query_task", "query_status"):
+                token = msg.get("token")
+                if not self.auth.validate(token):
+                    send_json_tcp(conn, {"ok": False, "error": "unauthenticated"})
+                    return
+                tid = msg.get("task_id")
+                with self.lock:
+                    t = self.tasks.get(tid)
+                if t:
+                    send_json_tcp(conn, {"ok": True, "task": t})
+                else:
+                    send_json_tcp(conn, {"ok": False, "error": "task_not_found"})
             elif typ == "task_result":
-                # caso um worker envie resultado assíncrono (extensão)
-                resp = self._handle_task_result(msg)
-                self._send_response(conn, resp)
+                # worker pode enviar resultado de forma assíncrona
+                tid = msg.get("task_id")
+                with self.lock:
+                    if tid in self.tasks:
+                        self.tasks[tid]["status"] = "done" if msg.get("ok", True) else "failed"
+                        self.tasks[tid]["result"] = msg.get("result") or msg.get("error")
+                        self.tasks[tid]["finished_at"] = time.time()
+                        # reduzir carga se worker known
+                        wid = msg.get("worker_id")
+                        if wid and wid in self.workers:
+                            self.workers[wid]["load"] = max(0, int(self.workers[wid].get("load", 1)) - 1)
+                        self._checkpoint_state()
+                send_json_tcp(conn, {"ok": True})
             else:
-                self._send_response(conn, {"ok": False, "error": "unknown_type"})
+                send_json_tcp(conn, {"ok": False, "error": "unknown_type"})
         except Exception:
-            logger.exception("Erro ao tratar conexão no orquestrador")
+            logger.exception("Erro ao tratar conexão")
         finally:
             try:
                 conn.close()
             except:
                 pass
 
-    def _send_response(self, conn, obj):
-        try:
-            data = json.dumps(obj).encode("utf-8")
-            conn.sendall(struct.pack("!I", len(data)))
-            conn.sendall(data)
-        except Exception:
-            logger.exception("Erro enviando resposta TCP")
-
-    def _register_worker(self, msg, addr):
-        wid = msg.get("worker_id") or str(uuid.uuid4())
-        host = msg.get("host") or addr[0]
-        port = msg.get("port") or msg.get("listen_port")
+    def _assign_task(self, task_id):
+        """Escolhe worker com menor carga (Least Load) e envia a tarefa (bloqueante - aguarda resposta)."""
         with self.lock:
-            self.workers[wid] = {
-                "host": host,
-                "port": port,
-                "last_hb": time.time(),
-                "load": int(msg.get("load", 0)),
-                "status": "active"
-            }
-            self.lamport.tick()
-            logger.info(f"Worker registrado: {wid} em {host}:{port}")
-        self._checkpoint_state()
-        return {"ok": True, "worker_id": wid}
-
-    def _handle_heartbeat(self, msg):
-        wid = msg.get("worker_id")
-        load = int(msg.get("load", 0))
-        rtime = msg.get("lamport", 0)
-        with self.lock:
-            if wid in self.workers:
-                self.workers[wid]["last_hb"] = time.time()
-                # atualizar carga reportada
-                self.workers[wid]["load"] = load
-                self.lamport.update(rtime)
-            else:
-                # aceitar registro via heartbeat
-                self.workers[wid] = {
-                    "host": msg.get("host"),
-                    "port": msg.get("port"),
-                    "last_hb": time.time(),
-                    "load": load,
-                    "status": "active"
-                }
-        self._checkpoint_state()
-        return {"ok": True, "lamport": self.lamport.read()}
-
-    def _choose_worker(self):
-        with self.lock:
-            alive = {k:v for k,v in self.workers.items() if v.get("status")=="active"}
+            # filtrar ativos
+            alive = {wid: w for wid, w in self.workers.items() if w.get("status") == "active"}
             if not alive:
-                return None
-            if self.balance_policy == "least_load":
-                sorted_workers = sorted(alive.items(), key=lambda it: int(it[1].get("load",0)))
-                return sorted_workers[0][0]
-            else:
-                return list(alive.keys())[0]
-
-    def _handle_submit_task(self, msg):
-        token = msg.get("token")
-        if not self.auth.validate(token):
-            return {"ok": False, "error": "unauthenticated"}
-        payload = msg.get("payload")
-        task_id = str(uuid.uuid4())
-        lamport_ts = self.lamport.tick()
-        assigned = self._choose_worker()
-        with self.lock:
-            self.tasks[task_id] = {
-                "client": self.auth.user_of(token),
-                "payload": payload,
-                "status": "assigned" if assigned else "pending",
-                "assigned_worker": assigned,
-                "lamport_ts": lamport_ts,
-                "created_at": time.time(),
-                "result": None
-            }
-            logger.info(f"Tarefa {task_id} submetida por {self.tasks[task_id]['client']} payload={payload} assigned={assigned}")
-        if assigned:
-            ok = self._send_task_to_worker(task_id, assigned)
-            if not ok:
-                with self.lock:
-                    self.tasks[task_id]["status"] = "pending"
-                    self.tasks[task_id]["assigned_worker"] = None
-        self._checkpoint_state()
-        return {"ok": True, "task_id": task_id, "lamport": lamport_ts}
-
-    def _send_task_to_worker(self, task_id, worker_id):
-        w = self.workers.get(worker_id)
-        if not w:
-            return False
-        # preparar payload para o worker
-        payload = {
-            "type": "execute_task",
-            "task_id": task_id,
-            "payload": self.tasks[task_id]["payload"],
-            "lamport": self.lamport.read()
-        }
+                logger.info("Nenhum worker disponível para atribuir tarefa")
+                return False
+            # escolher por menor carga
+            chosen_id, chosen_meta = min(alive.items(), key=lambda it: int(it[1].get("load", 0)))
+            # marcar tentative
+            self.tasks[task_id]["assigned_worker"] = chosen_id
+            self.tasks[task_id]["status"] = "assigned"
+            # incrementar carga estimada
+            self.workers[chosen_id]["load"] = int(self.workers[chosen_id].get("load", 0)) + 1
+            self.lamport.tick()
+        # enviar tarefa via TCP e aguardar resposta (síncrono)
         try:
-            # marcar como running e incrementar load antes de enviar
-            with self.lock:
-                self.tasks[task_id]["status"] = "running"
-                self.tasks[task_id]["assigned_worker"] = worker_id
-                self.tasks[task_id]["started_at"] = time.time()
-                # incrementar load estimada
-                w["load"] = int(w.get("load",0)) + 1
-
-            # enviar via TCP e aguardar resposta (sincrono)
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(10.0)
-            s.connect((w["host"], int(w["port"])))
-            data = json.dumps(payload).encode("utf-8")
-            s.sendall(struct.pack("!I", len(data)))
-            s.sendall(data)
-            raw_len = recvall(s, 4)
-            if not raw_len:
-                s.close()
-                raise RuntimeError("No response from worker")
-            length = int.from_bytes(raw_len, "big")
-            raw = recvall(s, length)
-            resp = json.loads(raw.decode("utf-8")) if raw else None
+            s.connect((chosen_meta["host"], int(chosen_meta["port"])))
+            payload = {
+                "type": "execute_task",
+                "task_id": task_id,
+                "payload": self.tasks[task_id]["payload"],
+                "lamport": self.lamport.read()
+            }
+            send_json_tcp(s, payload)
+            # esperar resposta do worker no mesmo socket
+            resp = recv_json_tcp(s)
             s.close()
-
-            # processar resposta do worker
             with self.lock:
-                # reduzir carga (o worker terminou)
-                w["load"] = max(0, int(w.get("load",0)) - 1)
                 if resp and resp.get("ok"):
                     self.tasks[task_id]["status"] = "done"
                     self.tasks[task_id]["result"] = resp.get("result")
                     self.tasks[task_id]["finished_at"] = time.time()
-                    logger.info(f"Tarefa {task_id} concluída pelo worker {worker_id}")
+                    # decrementar carga
+                    self.workers[chosen_id]["load"] = max(0, int(self.workers[chosen_id].get("load", 1)) - 1)
+                    logger.info(f"Tarefa {task_id} concluída pelo worker {chosen_id}")
                 else:
-                    # erro na execução => marcar pendente e sinalizar falha se necessário
+                    # falha no worker => marcar pendente e reduzir carga
+                    logger.warning(f"Tarefa {task_id} retornou erro do worker {chosen_id} ou resp nula")
                     self.tasks[task_id]["status"] = "pending"
                     self.tasks[task_id]["assigned_worker"] = None
-                    logger.warning(f"Tarefa {task_id} retornou erro do worker {worker_id}; será reatribuída")
-                    # considerar worker falho
-                    self.workers[worker_id]["status"] = "failed"
+                    self.workers[chosen_id]["status"] = "failed"
+                    self.workers[chosen_id]["load"] = max(0, int(self.workers[chosen_id].get("load", 1)) - 1)
             self._checkpoint_state()
             return True
         except Exception:
-            logger.exception("Falha ao enviar/receber tarefa do worker")
-            # marcar worker como failed e reatribuir
+            logger.exception(f"Erro ao enviar tarefa {task_id} para worker {chosen_id}")
             with self.lock:
-                if worker_id in self.workers:
-                    self.workers[worker_id]["status"] = "failed"
-                    self.workers[worker_id]["load"] = max(0, int(self.workers[worker_id].get("load",0)) - 1)
-                # reset task para pending
-                if task_id in self.tasks:
-                    self.tasks[task_id]["status"] = "pending"
-                    self.tasks[task_id]["assigned_worker"] = None
+                # rollback marcações
+                self.tasks[task_id]["status"] = "pending"
+                self.tasks[task_id]["assigned_worker"] = None
+                if chosen_id in self.workers:
+                    self.workers[chosen_id]["status"] = "failed"
+                    self.workers[chosen_id]["load"] = max(0, int(self.workers[chosen_id].get("load", 1)) - 1)
             self._checkpoint_state()
             return False
 
-    def _handle_query(self, msg):
-        token = msg.get("token")
-        if not self.auth.validate(token):
-            return {"ok": False, "error": "unauthenticated"}
-        task_id = msg.get("task_id")
-        with self.lock:
-            if task_id in self.tasks:
-                return {"ok": True, "task": self.tasks[task_id], "lamport": self.lamport.read()}
-            else:
-                return {"ok": False, "error": "task_not_found"}
-
-    def _handle_task_result(self, msg):
-        # endpoint opcional para worker enviar resultado assíncrono
-        task_id = msg.get("task_id")
-        ok = msg.get("ok", False)
-        with self.lock:
-            if task_id in self.tasks:
-                if ok:
-                    self.tasks[task_id]["status"] = "done"
-                    self.tasks[task_id]["result"] = msg.get("result")
-                    self.tasks[task_id]["finished_at"] = time.time()
-                else:
-                    self.tasks[task_id]["status"] = "pending"
-                    self.tasks[task_id]["assigned_worker"] = None
-                self._checkpoint_state()
-                return {"ok": True}
-            else:
-                return {"ok": False, "error": "task_not_found"}
-
     def _heartbeat_checker_loop(self):
-        while self.running:
+        while True:
+            time.sleep(1.0)
             now = time.time()
-            to_mark = []
+            dead = []
             with self.lock:
                 for wid, meta in list(self.workers.items()):
                     if now - meta.get("last_hb", 0) > settings.WORKER_TIMEOUT:
-                        to_mark.append(wid)
-            for wid in to_mark:
-                with self.lock:
-                    if wid in self.workers:
-                        self.workers[wid]["status"] = "failed"
-                        logger.warning(f"Worker {wid} considerado falho (timeout). Reatribuindo tarefas.")
-                        # reatribuir tarefas atribuídas a esse worker
-                        for tid, t in self.tasks.items():
-                            if t.get("assigned_worker") == wid and t.get("status") != "done":
-                                t["status"] = "pending"
-                                t["assigned_worker"] = None
-                # tentar redistribuir pendentes fora do lock
-                self._redistribute_pending()
-            time.sleep(1.0)
-
-    def _redistribute_pending(self):
-        with self.lock:
-            pendings = [tid for tid,t in self.tasks.items() if t["status"] in ("pending",)]
-        for tid in pendings:
-            chosen = self._choose_worker()
-            if chosen:
-                self._send_task_to_worker(tid, chosen)
-        self._checkpoint_state()
+                        logger.warning(f"Worker {wid} considerado falho (timeout).")
+                        meta["status"] = "failed"
+                        dead.append(wid)
+                # reatribuir tarefas de workers falhos
+                for tid, t in self.tasks.items():
+                    wid = t.get("assigned_worker")
+                    if wid in dead and t.get("status") != "done":
+                        t["status"] = "pending"
+                        t["assigned_worker"] = None
+            # tentar redistribuir pendentes
+            with self.lock:
+                pendings = [tid for tid, t in self.tasks.items() if t["status"] == "pending"]
+            for tid in pendings:
+                self._assign_task(tid)
+            # salvar checkpoint
+            self._checkpoint_state()
 
     def _state_multicast_loop(self):
-        while self.running:
+        sock = create_multicast_sender(ttl=1)
+        group_addr = (settings.BACKUP_MULTICAST_GROUP, settings.BACKUP_MULTICAST_PORT)
+        while True:
             try:
-                state = self._gather_state()
-                msg = json.dumps({"type":"state_sync","state":state}).encode("utf-8")
-                self.multicast_sock.sendto(msg, (settings.BACKUP_MULTICAST_GROUP, settings.BACKUP_MULTICAST_PORT))
+                state = {"workers": self.workers, "tasks": self.tasks, "lamport": self.lamport.read(), "timestamp": time.time()}
+                send_json_udp(sock, {"type": "state_sync", "state": state}, group_addr)
             except Exception:
-                logger.exception("Erro no multicast state")
+                logger.exception("Erro no envio multicast do estado")
             time.sleep(1.0)
-
-    def _gather_state(self):
-        with self.lock:
-            return {
-                "workers": self.workers,
-                "tasks": self.tasks,
-                "lamport": self.lamport.read(),
-                "timestamp": time.time()
-            }
 
     def _checkpoint_state(self):
         try:
-            state = self._gather_state()
+            state = {"workers": self.workers, "tasks": self.tasks, "lamport": self.lamport.read()}
             with open(settings.STATE_CHECKPOINT_FILE, "w", encoding="utf-8") as f:
                 json.dump(state, f, indent=2, default=str)
         except Exception:
             logger.exception("Erro ao salvar checkpoint")
 
 if __name__ == "__main__":
-    o = Orchestrator()
-    o.start()
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        logger.info("Orquestrador encerrando...")
+    Orchestrator().start()

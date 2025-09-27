@@ -1,20 +1,21 @@
+# src/lamport.py
 import threading
 
 class LamportClock:
     def __init__(self):
+        self._time = 0
         self._lock = threading.Lock()
-        self.time = 0
 
-    def tick(self):
+    def tick(self) -> int:
         with self._lock:
-            self.time += 1
-            return self.time
+            self._time += 1
+            return self._time
 
-    def update(self, received_time: int):
+    def update(self, received_time: int) -> int:
         with self._lock:
-            self.time = max(self.time, received_time) + 1
-            return self.time
+            self._time = max(self._time, int(received_time)) + 1
+            return self._time
 
-    def read(self):
+    def read(self) -> int:
         with self._lock:
-            return self.time
+            return int(self._time)

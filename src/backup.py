@@ -1,82 +1,59 @@
 # src/backup.py
-import os, sys
-ROOT = os.path.dirname(os.path.abspath(__file__))
-if ROOT not in sys.path:
-    sys.path.insert(0, ROOT)
-
 import threading
-import json
 import time
-from config import settings
-from common import start_multicast_listener
-from lamport import LamportClock
-from logger_setup import get_logger
+import json
+import socket
+import traceback
 
-logger = get_logger("backup")
+import config.settings as settings
+from src.common import create_multicast_listener, recv_json_udp
+from src.logger_setup import get_logger
+
+logger = get_logger("Backup")
 
 class BackupOrchestrator:
     def __init__(self):
-        self.lamport = LamportClock()
         self.state = {}
-        self.multicast_sock = start_multicast_listener(settings.BACKUP_MULTICAST_GROUP, settings.BACKUP_MULTICAST_PORT)
-        self.running = True
         self.last_state_time = time.time()
-        self.is_primary = False
+        self.running = True
         self.assumed_orchestrator = None
 
     def start(self):
-        t = threading.Thread(target=self._listen_loop, daemon=True)
-        t.start()
-        t2 = threading.Thread(target=self._failover_detector_loop, daemon=True)
-        t2.start()
-        logger.info("Backup Orchestrador iniciado; aguardando multicast do orquestrador principal")
+        try:
+            sock = create_multicast_listener(settings.BACKUP_MULTICAST_GROUP, settings.BACKUP_MULTICAST_PORT)
+        except Exception:
+            logger.exception("Falha ao criar socket multicast")
+            return
 
-    def _listen_loop(self):
+        t = threading.Thread(target=self._failover_monitor, daemon=True)
+        t.start()
+
+        logger.info("Backup iniciado: escutando estado do orquestrador principal via multicast")
         while self.running:
             try:
-                data, addr = self.multicast_sock.recvfrom(65536)
-                msg = json.loads(data.decode("utf-8"))
+                msg, addr = recv_json_udp(sock)
                 if msg.get("type") == "state_sync":
-                    self.state = msg.get("state")
-                    lam = self.state.get("lamport", 0)
-                    self.lamport.update(lam)
+                    self.state = msg.get("state", {})
                     self.last_state_time = time.time()
-                    # guardar checkpoint local
-                    self._checkpoint()
             except Exception:
-                # É normal gerar exceções ao encerrar
-                logger.debug("Erro/timeout recebendo multicast (ou socket fechado).")
-            time.sleep(0.01)
+                # ler exceptions mas não parar
+                time.sleep(0.1)
 
-    def _failover_detector_loop(self):
+    def _failover_monitor(self):
         while self.running:
-            # se há mais de 5s sem mensagem => assumir primário
-            if time.time() - self.last_state_time > 5.0 and not self.is_primary:
-                logger.warning("Perda de contato com orquestrador principal. Tentando assumir (failover).")
-                self.is_primary = True
-                # iniciar um orquestrador local com o estado que temos
+            time.sleep(1.0)
+            if time.time() - self.last_state_time > 5.0 and self.assumed_orchestrator is None:
+                logger.warning("Backup: não recebe estado - assumindo orquestrador principal.")
+                # iniciar orquestrador local com o estado que tem
                 try:
-                    from orchestrator import Orchestrator
-                    # iniciar em uma thread separado para não bloquear o backup
+                    from src.orchestrator import Orchestrator
                     self.assumed_orchestrator = Orchestrator(initial_state=self.state)
                     threading.Thread(target=self.assumed_orchestrator.start, daemon=True).start()
-                    logger.info("Orquestrador local iniciado pelo backup.")
+                    logger.info("Backup: Orchestrador local iniciado (failover).")
                 except Exception:
-                    logger.exception("Erro ao iniciar orquestrador local a partir do backup")
-            time.sleep(1.0)
-
-    def _checkpoint(self):
-        try:
-            with open(settings.STATE_CHECKPOINT_FILE + ".backup", "w", encoding="utf-8") as f:
-                json.dump(self.state, f, indent=2, default=str)
-        except Exception:
-            logger.exception("Erro ao salvar checkpoint backup")
+                    logger.exception("Backup: erro ao iniciar orquestrador local")
+                    traceback.print_exc()
+                break
 
 if __name__ == "__main__":
-    b = BackupOrchestrator()
-    b.start()
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        logger.info("Backup encerrando...")
+    BackupOrchestrator().start()
